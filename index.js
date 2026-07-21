@@ -282,31 +282,108 @@ function buildLedgerVerifyResult(backup) {
   return { ...res, status: res.ok ? 'verified' : 'suspicious' };
 }
 
-function buildAchievementVerifyRows(backup, requestedId = 'all') {
-  const unlocked = extractAchievementMap(backup), meta = extractAchievementMetaMap(backup);
-  const events = normalizeVerifyEvents(Array.isArray(backup?.data?.eventLog?.warm) ? backup.data.eventLog.warm : []);
-  const eventByAch = new Map(events.filter(e => safeString(e?.type) === 'ACHIEVEMENT_UNLOCK' && safeString(e?.data?.id)).map(e => [safeString(e.data.id), e]));
+function buildAchievementVerifyRows(
+  backup,
+  requestedId = 'all'
+) {
+  const unlocked = extractAchievementMap(backup);
+  const meta = extractAchievementMetaMap(backup);
+  const events = normalizeVerifyEvents(
+    Array.isArray(backup?.data?.eventLog?.warm)
+      ? backup.data.eventLog.warm
+      : []
+  );
+
+  const eventByAch = new Map(
+    events
+      .filter(event =>
+        safeString(event?.type) === 'ACHIEVEMENT_UNLOCK' &&
+        safeString(event?.data?.id)
+      )
+      .map(event => [
+        safeString(event.data.id),
+        event
+      ])
+  );
+
   const ledger = buildLedgerVerifyResult(backup);
-  const ids = requestedId && requestedId !== 'all' ? [requestedId] : [...new Set([...Object.keys(unlocked || {}), ...Object.keys(meta || {})])];
-  return ids.filter(Boolean).map(id => {
-    const m = meta[id] || {}, ev = eventByAch.get(id) || null, synced = !!unlocked[id] || !!m.unlockedAt;
-    const hasProof = !!safeString(m.eventId || ev?.eventId || '') || safeNum(m.unlockedAt || unlocked[id]) > 0;
-    const suspicious = !ledger.ok || (synced && !hasProof);
-    const verified = synced && hasProof && ledger.ok;
-    return {
-      id,
-      localUnlocked: false,
-      synced,
-      verified,
-      claimable: verified && !suspicious,
-      suspicious,
-      status: suspicious ? 'suspicious' : (verified ? 'verified' : (synced ? 'synced' : 'not_synced')),
-      reason: suspicious ? (ledger.ok ? 'achievement_proof_missing' : 'ledger_or_payload_failed') : (verified ? 'server_verified' : 'not_in_cloud_backup'),
-      unlockedAt: safeNum(m.unlockedAt || unlocked[id] || 0),
-      eventId: safeString(m.eventId || ev?.eventId || ''),
-      deviceStableId: safeString(m.deviceStableId || ev?.deviceStableId || '')
-    };
-  });
+  const ids = requestedId && requestedId !== 'all'
+    ? [requestedId]
+    : [...new Set([
+        ...Object.keys(unlocked || {}),
+        ...Object.keys(meta || {})
+      ])];
+
+  return ids
+    .filter(Boolean)
+    .map(id => {
+      const achievementMeta = meta[id] || {};
+      const event = eventByAch.get(id) || null;
+      const synced =
+        !!unlocked[id] ||
+        !!achievementMeta.unlockedAt;
+
+      const hasEvidence =
+        !!safeString(
+          achievementMeta.eventId ||
+          event?.eventId ||
+          ''
+        ) ||
+        safeNum(
+          achievementMeta.unlockedAt ||
+          unlocked[id]
+        ) > 0;
+
+      const evidenceValid =
+        synced &&
+        hasEvidence &&
+        ledger.ok;
+
+      const suspicious =
+        !ledger.ok ||
+        (synced && !hasEvidence);
+
+      return {
+        id,
+        localUnlocked: false,
+        synced,
+        evidenceValid,
+        verified: false,
+        claimable: false,
+        suspicious,
+        status: suspicious
+          ? 'suspicious'
+          : evidenceValid
+            ? 'legacy_evidence'
+            : synced
+              ? 'synced'
+              : 'not_synced',
+        reason: suspicious
+          ? (
+              ledger.ok
+                ? 'achievement_evidence_missing'
+                : 'ledger_or_payload_failed'
+            )
+          : evidenceValid
+            ? 'legacy_client_evidence_only'
+            : 'not_in_cloud_backup',
+        unlockedAt: safeNum(
+          achievementMeta.unlockedAt ||
+          unlocked[id] ||
+          0
+        ),
+        eventId: safeString(
+          achievementMeta.eventId ||
+          event?.eventId ||
+          ''
+        ),
+        deviceStableId: safeString(
+          achievementMeta.deviceStableId ||
+          event?.deviceStableId ||
+          ''
+        )
+      };
+    });
 }
 
 function buildClaimId({ ownerYandexId = '', achievementId = '', checksum = '' } = {}) {
@@ -987,7 +1064,7 @@ module.exports.handler = async event => {
     return reply(200, enrichBody('ping', {
       ok: true,
       mode: 'ping',
-      service: 'yandex-disk-proxy',
+      service: 'vi3na1bita-backup-proxy',
       time: nowTs()
     }));
   }
