@@ -26,9 +26,7 @@ const EVENT_ARCHIVE_DIR = `${APP_ROOT}/events`;
 const EVENT_ARCHIVE_INDEX_PATH = `${EVENT_ARCHIVE_DIR}/index.json`;
 const EVENT_SEGMENT_RE = /^app:\/Backup\/events\/seg_[A-Za-z0-9._-]+_\d+_\d+_[A-Za-z0-9._-]+\.json$/;
 const DEVICE_SETTINGS_FILE_RE = /^app:\/Backup\/device-settings\/[A-Za-z0-9._-]+\.json$/;
-const CLAIMS_DIR = `${APP_ROOT}/claims`;
-const CLAIMS_INDEX_PATH = `${CLAIMS_DIR}/index.json`;
-const ALLOWED_MODES = new Set(['ping', 'meta', 'list', 'download', 'device_index', 'device_meta', 'device_download', 'event_index', 'event_download', 'archive_inspect', 'archive_list_files', 'archive_delete_segments', 'upload_meta', 'upload_backup', 'upload_device_settings', 'upload_event_segment', 'ledger_verify', 'achievement_verify', 'claim_index', 'claim_prepare', 'claim_validate', 'lease_get', 'lease_acquire', 'lease_release']);
+const ALLOWED_MODES = new Set(['ping', 'meta', 'list', 'download', 'device_index', 'device_meta', 'device_download', 'event_index', 'event_download', 'archive_inspect', 'archive_list_files', 'archive_delete_segments', 'upload_meta', 'upload_backup', 'upload_device_settings', 'upload_event_segment', 'ledger_verify', 'lease_get', 'lease_acquire', 'lease_release']);
 
 const safeString = v => String(v == null ? '' : v).trim();
 const safeNum = v => Number.isFinite(Number(v)) ? Number(v) : 0;
@@ -214,7 +212,6 @@ const safeParse = str => {
 const sortObj = v => Array.isArray(v) ? v.map(sortObj) : (!v || typeof v !== 'object') ? v : Object.keys(v).sort().reduce((a, k) => (a[k] = sortObj(v[k]), a), {});
 const stableStringify = v => JSON.stringify(sortObj(v));
 const sha256Hex = v => crypto.createHash('sha256').update(String(v || ''), 'utf8').digest('hex');
-const achievementIdSafe = v => safeString(v).replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 96);
 
 const verifyBackupPayloadHash = b => {
   const expected = safeString(b?.integrity?.payloadHash || '');
@@ -232,17 +229,6 @@ const verifyEventHashes = events => {
     if (sha256Hex(stableStringify(rest)) !== safeString(eventHash)) broken++;
   }
   return { checked, broken, ok: broken === 0 };
-};
-
-const extractAchievementMap = b => {
-  const st = b?.data?.achievementState || {};
-  const raw = st.unlocked || b?.data?.achievements || {};
-  return raw && typeof raw === 'object' ? raw : {};
-};
-
-const extractAchievementMetaMap = b => {
-  const st = b?.data?.achievementState || {};
-  return st.unlockMeta && typeof st.unlockMeta === 'object' ? st.unlockMeta : {};
 };
 
 async function readLatestBackupForVerify(token) {
@@ -280,114 +266,6 @@ function buildLedgerVerifyResult(backup) {
     checksum: safeString(backup?.integrity?.payloadHash || '')
   };
   return { ...res, status: res.ok ? 'verified' : 'suspicious' };
-}
-
-function buildAchievementVerifyRows(
-  backup,
-  requestedId = 'all'
-) {
-  const unlocked = extractAchievementMap(backup);
-  const meta = extractAchievementMetaMap(backup);
-  const events = normalizeVerifyEvents(
-    Array.isArray(backup?.data?.eventLog?.warm)
-      ? backup.data.eventLog.warm
-      : []
-  );
-
-  const eventByAch = new Map(
-    events
-      .filter(event =>
-        safeString(event?.type) === 'ACHIEVEMENT_UNLOCK' &&
-        safeString(event?.data?.id)
-      )
-      .map(event => [
-        safeString(event.data.id),
-        event
-      ])
-  );
-
-  const ledger = buildLedgerVerifyResult(backup);
-  const ids = requestedId && requestedId !== 'all'
-    ? [requestedId]
-    : [...new Set([
-        ...Object.keys(unlocked || {}),
-        ...Object.keys(meta || {})
-      ])];
-
-  return ids
-    .filter(Boolean)
-    .map(id => {
-      const achievementMeta = meta[id] || {};
-      const event = eventByAch.get(id) || null;
-      const synced =
-        !!unlocked[id] ||
-        !!achievementMeta.unlockedAt;
-
-      const hasEvidence =
-        !!safeString(
-          achievementMeta.eventId ||
-          event?.eventId ||
-          ''
-        ) ||
-        safeNum(
-          achievementMeta.unlockedAt ||
-          unlocked[id]
-        ) > 0;
-
-      const evidenceValid =
-        synced &&
-        hasEvidence &&
-        ledger.ok;
-
-      const suspicious =
-        !ledger.ok ||
-        (synced && !hasEvidence);
-
-      return {
-        id,
-        localUnlocked: false,
-        synced,
-        evidenceValid,
-        verified: false,
-        claimable: false,
-        suspicious,
-        status: suspicious
-          ? 'suspicious'
-          : evidenceValid
-            ? 'legacy_evidence'
-            : synced
-              ? 'synced'
-              : 'not_synced',
-        reason: suspicious
-          ? (
-              ledger.ok
-                ? 'achievement_evidence_missing'
-                : 'ledger_or_payload_failed'
-            )
-          : evidenceValid
-            ? 'legacy_client_evidence_only'
-            : 'not_in_cloud_backup',
-        unlockedAt: safeNum(
-          achievementMeta.unlockedAt ||
-          unlocked[id] ||
-          0
-        ),
-        eventId: safeString(
-          achievementMeta.eventId ||
-          event?.eventId ||
-          ''
-        ),
-        deviceStableId: safeString(
-          achievementMeta.deviceStableId ||
-          event?.deviceStableId ||
-          ''
-        )
-      };
-    });
-}
-
-function buildClaimId({ ownerYandexId = '', achievementId = '', checksum = '' } = {}) {
-  return `claim_${sha256Hex(`${ownerYandexId}::${achievementId}::${checksum}`).slice(0, 18)}`;
 }
 
 const normalizeVerifyEvents = rows => {
@@ -444,30 +322,6 @@ async function readLatestBackupWithArchiveForVerify(token) {
   return { ok: true, backup, archive };
 }
 
-function readClaimsIndexShape(raw) {
-  const rows = Array.isArray(raw?.items) ? raw.items : [];
-  return { version: 'claims-v1', updatedAt: nowTs(), items: rows.filter(x => safeString(x?.claimId)).slice(-200) };
-}
-
-async function readClaimsIndex(token) {
-  const r = await downloadJsonResourceByPath(token, CLAIMS_INDEX_PATH, {
-    link: 'claim_index_link',
-    parse: 'claim_index_parse',
-    file: 'claim_index_file',
-    json: 'claim_index_json'
-  }).catch(() => null);
-  return r?.type === 'ok' ? readClaimsIndexShape(r.data) : readClaimsIndexShape({ items: [] });
-}
-
-async function appendClaimAttempt(token, row) {
-  await ensureDiskDir(token, APP_ROOT).catch(() => false);
-  await ensureDiskDir(token, CLAIMS_DIR).catch(() => false);
-  const idx = await readClaimsIndex(token).catch(() => readClaimsIndexShape({ items: [] }));
-  const item = { claimId: safeString(row.claimId), achievementId: achievementIdSafe(row.achievementId), status: safeString(row.status), result: safeString(row.result), checksum: safeString(row.checksum), preparedAt: safeNum(row.preparedAt) || nowTs(), validatedAt: safeNum(row.validatedAt), mode: safeString(row.mode || 'claim_prepare') };
-  const next = readClaimsIndexShape({ items: [...idx.items.filter(x => !(x.claimId === item.claimId && x.achievementId === item.achievementId)), item].slice(-200) });
-  const wr = await uploadJsonResourceByPath(token, CLAIMS_INDEX_PATH, next);
-  return { ok: !!wr.ok, index: next, status: wr.status, raw: wr.raw };
-}
 async function listDiskFolderItems(token, path, { pageLimit = 200, maxItems = 2000 } = {}) {
   const out = [];
   for (let offset = 0; offset < maxItems; offset += pageLimit) {
@@ -1132,47 +986,6 @@ module.exports.handler = async event => {
       return reply(200, enrichBody('ledger_verify', { ...buildLedgerVerifyResult(rb.backup), archive: rb.archive || null }));
     } catch (e) {
       return reply(500, enrichBody('ledger_verify', { ok: false, status: 'error', error: 'ledger_verify_error', message: safeString(e?.message) }));
-    }
-  }
-
-  if (mode === 'achievement_verify') {
-    try {
-      const id = achievementIdSafe(getQuery(event, 'achievementId') || 'all') || 'all';
-      const rb = await readLatestBackupWithArchiveForVerify(token);
-      if (!rb.ok) return reply(200, enrichBody('achievement_verify', { ok: false, status: 'unavailable', reason: rb.reason, items: [] }));
-      const ledger = buildLedgerVerifyResult(rb.backup);
-      const items = buildAchievementVerifyRows(rb.backup, id);
-      return reply(200, enrichBody('achievement_verify', { ok: true, status: ledger.status, ledger, archive: rb.archive || null, items }));
-    } catch (e) {
-      return reply(500, enrichBody('achievement_verify', { ok: false, status: 'error', error: 'achievement_verify_error', message: safeString(e?.message), items: [] }));
-    }
-  }
-
-  if (mode === 'claim_index') {
-    try {
-      const idx = await readClaimsIndex(token);
-      return reply(200, enrichBody('claim_index', { ok: true, index: idx }));
-    } catch (e) {
-      return reply(500, enrichBody('claim_index', { ok: false, error: 'claim_index_error', message: safeString(e?.message) }));
-    }
-  }
-
-  if (mode === 'claim_prepare' || mode === 'claim_validate') {
-    try {
-      const achievementId = achievementIdSafe(getQuery(event, 'achievementId'));
-      if (!achievementId) return reply(400, enrichBody(mode, { ok: false, error: 'achievement_id_required' }));
-      const rb = await readLatestBackupWithArchiveForVerify(token);
-      if (!rb.ok) return reply(200, enrichBody(mode, { ok: false, status: 'unavailable', reason: rb.reason }));
-      const row = buildAchievementVerifyRows(rb.backup, achievementId)[0] || null;
-      const ownerYandexId = safeString(rb.backup?.identity?.ownerYandexId || '');
-      const checksum = safeString(rb.backup?.integrity?.payloadHash || '');
-      const claimId = buildClaimId({ ownerYandexId, achievementId, checksum });
-      const ok = !!row?.claimable;
-      const out = { ok, claimId, achievementId, status: ok ? 'claimable' : (row?.status || 'not_claimable'), result: ok ? 'prepared' : 'manual_review', item: row, checksum, archive: rb.archive || null };
-      const wr = await appendClaimAttempt(token, { ...out, mode, preparedAt: nowTs(), validatedAt: mode === 'claim_validate' ? nowTs() : 0 }).catch(e => ({ ok: false, error: safeString(e?.message) }));
-      return reply(200, enrichBody(mode, { ...out, claimsRegistry: { written: !!wr?.ok, error: wr?.error || '' } }));
-    } catch (e) {
-      return reply(500, enrichBody(mode, { ok: false, status: 'error', error: `${mode}_error`, message: safeString(e?.message) }));
     }
   }
 
