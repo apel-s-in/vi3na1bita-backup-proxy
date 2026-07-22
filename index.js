@@ -230,7 +230,220 @@ const verifyEventHashes = events => {
   }
   return { checked, broken, ok: broken === 0 };
 };
+async function readYandexOwnerId(token) {
+  const response = await httpsGet(
+    'https://login.yandex.ru/info?format=json',
+    {
+      Authorization: `OAuth ${token}`,
+      Accept: 'application/json'
+    },
+    0,
+    META_ONLY_TIMEOUT_MS
+  );
 
+  if (
+    response.status === 401 ||
+    response.status === 403
+  ) {
+    return {
+      ok: false,
+      status: response.status,
+      error: 'bad_yandex_oauth'
+    };
+  }
+
+  if (response.status !== 200) {
+    return {
+      ok: false,
+      status: response.status,
+      error: 'yandex_identity_unavailable'
+    };
+  }
+
+  const profile = safeParse(response.body);
+  const yandexId = safeString(profile?.id);
+
+  return yandexId
+    ? {
+        ok: true,
+        yandexId
+      }
+    : {
+        ok: false,
+        status: 502,
+        error: 'bad_yandex_profile'
+      };
+}
+
+async function validateBackupUpload(
+  token,
+  backup
+) {
+  if (
+    !backup ||
+    typeof backup !== 'object' ||
+    Array.isArray(backup)
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'backup_object_required'
+    };
+  }
+
+  if (
+    safeString(backup.version) !== '6.0' ||
+    !backup.identity ||
+    !backup.data ||
+    !backup.integrity
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'backup_schema_invalid'
+    };
+  }
+
+  const payloadCheck =
+    verifyBackupPayloadHash(backup);
+
+  if (!payloadCheck.ok) {
+    return {
+      ok: false,
+      status: 409,
+      error: payloadCheck.reason,
+      payload: payloadCheck
+    };
+  }
+
+  const identity =
+    await readYandexOwnerId(token);
+
+  if (!identity.ok) return identity;
+
+  const ownerYandexId = safeString(
+    backup.identity.ownerYandexId
+  );
+
+  if (
+    !ownerYandexId ||
+    ownerYandexId !== identity.yandexId
+  ) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'backup_owner_mismatch'
+    };
+  }
+
+  const internalUserId = safeString(
+    backup.identity.internalUserId
+  );
+
+  const expectedOwnerBinding = sha256Hex([
+    ownerYandexId || 'anon',
+    internalUserId || 'local',
+    payloadCheck.actual
+  ].join('::'));
+
+  if (
+    safeString(backup.integrity.ownerBinding) !==
+    expectedOwnerBinding
+  ) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'backup_owner_binding_mismatch'
+    };
+  }
+
+  const events = Array.isArray(
+    backup?.data?.eventLog?.warm
+  )
+    ? backup.data.eventLog.warm
+    : [];
+
+  if (events.length > 10000) {
+    return {
+      ok: false,
+      status: 413,
+      error: 'backup_event_limit_exceeded'
+    };
+  }
+
+  const eventHashes = verifyEventHashes(events);
+
+  if (!eventHashes.ok) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'backup_event_hash_mismatch',
+      eventHashes
+    };
+  }
+
+  return {
+    ok: true,
+    ownerYandexId,
+    payloadHash: payloadCheck.actual,
+    eventHashes
+  };
+}
+
+function validateEventSegmentUpload(segment) {
+  if (
+    !segment ||
+    typeof segment !== 'object' ||
+    !Array.isArray(segment.events)
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'event_segment_invalid'
+    };
+  }
+
+  if (
+    segment.events.length < 1 ||
+    segment.events.length > 500
+  ) {
+    return {
+      ok: false,
+      status: 413,
+      error: 'event_segment_size_invalid'
+    };
+  }
+
+  const expected = safeString(segment.hash);
+  const actual = sha256Hex(
+    stableStringify(segment.events)
+  );
+
+  if (!expected || expected !== actual) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'event_segment_hash_mismatch'
+    };
+  }
+
+  const hashes = verifyEventHashes(
+    segment.events
+  );
+
+  if (!hashes.ok) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'event_hash_mismatch'
+    };
+  }
+
+  return {
+    ok: true,
+    hashes
+  };
+}
 async function readLatestBackupForVerify(token) {
   const r = await downloadBackup(token, BACKUP_PATH);
   if (r.type !== 'ok') return { ok: false, reason: r.type, raw: r };
@@ -999,6 +1212,45 @@ module.exports.handler = async event => {
       if (!path) return reply(400, enrichBody(mode, { error: 'bad_upload_path' }));
       const payload = resolveUploadPayload(mode, body);
       if (!payload || typeof payload !== 'object') return reply(400, enrichBody(mode, { error: 'bad_upload_payload', path }));
+
+      if (mode === 'upload_backup') {
+        const validation =
+          await validateBackupUpload(
+            token,
+            payload
+          );
+
+        if (!validation.ok) {
+          return reply(
+            validation.status || 409,
+            enrichBody(mode, {
+              ok: false,
+              error: validation.error,
+              validation
+            })
+          );
+        }
+      }
+
+      if (
+        mode === 'upload_event_segment' &&
+        path !== EVENT_ARCHIVE_INDEX_PATH
+      ) {
+        const validation =
+          validateEventSegmentUpload(payload);
+
+        if (!validation.ok) {
+          return reply(
+            validation.status || 409,
+            enrichBody(mode, {
+              ok: false,
+              error: validation.error,
+              validation
+            })
+          );
+        }
+      }
+
       await ensureDiskDir(token, APP_ROOT).catch(() => false);
       const pd = parentDiskDir(path);
       if (pd && pd !== APP_ROOT) await ensureDiskDir(token, pd).catch(() => false);
