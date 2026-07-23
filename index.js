@@ -804,12 +804,6 @@ async function downloadJsonBySignedHref(href, timeoutMs = META_ONLY_TIMEOUT_MS) 
   return safeParse(res.body);
 }
 
-async function validateToken(/* token */) {
-  // Валидацию токена выполняет сам Yandex Disk (401/403 от API).
-  // Доп. прыжок в login.yandex.ru/info только замедляет функцию и иногда возвращает 403 из-за скоупов,
-  // поэтому здесь возвращаем нейтральный ok=true и дальше полагаемся на реальные ответы Диска.
-  return { ok: true, degraded: false };
-}
 async function uploadJsonResourceByPath(token, path, data) {
   const linkRes = await getDiskJson(`${API}/resources/upload?path=${encodeURIComponent(path)}&overwrite=true`, token, META_ONLY_TIMEOUT_MS);
   if (linkRes.status !== 200 || !linkRes.json?.href) return { ok: false, status: linkRes.status, raw: safeString(linkRes.rawBody).slice(0, 300) };
@@ -1228,14 +1222,10 @@ module.exports.handler = async event => {
   const token = extractAnyToken(event);
   if (!token) return reply(401, enrichBody(mode, { error: 'no_token' }));
 
-  const valid = await validateToken(token).catch(() => ({ ok: true, degraded: true }));
-  if (!valid.ok && Number(valid?.status || 0) === 401) {
-    return reply(401, enrichBody(mode, {
-      error: valid.error,
-      hint: 'Token rejected by Yandex OAuth. User needs to re-login.',
-      status: valid.status
-    }));
-  }
+  const valid = {
+    ok: true,
+    degraded: false
+  };
 
   if (mode === 'meta') {
     try {
