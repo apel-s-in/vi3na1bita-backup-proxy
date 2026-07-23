@@ -27,6 +27,8 @@ const EVENT_ARCHIVE_INDEX_PATH = `${EVENT_ARCHIVE_DIR}/index.json`;
 const EVENT_SEGMENT_RE = /^app:\/Backup\/events\/seg_[A-Za-z0-9._-]+_\d+_\d+_[A-Za-z0-9._-]+\.json$/;
 const DEVICE_SETTINGS_FILE_RE = /^app:\/Backup\/device-settings\/[A-Za-z0-9._-]+\.json$/;
 const ALLOWED_MODES = new Set(['ping', 'meta', 'list', 'download', 'device_index', 'device_meta', 'device_download', 'event_index', 'event_download', 'archive_inspect', 'archive_list_files', 'archive_delete_segments', 'upload_meta', 'upload_backup', 'upload_device_settings', 'upload_event_segment', 'ledger_verify', 'lease_get', 'lease_acquire', 'lease_release']);
+const SIGNALING_URL = String(process.env.SIGNALING_URL || '').trim();
+const BACKUP_RECEIPT_SECRET = String(process.env.BACKUP_RECEIPT_SECRET || '').trim();
 
 const safeString = v => String(v == null ? '' : v).trim();
 const safeNum = v => Number.isFinite(Number(v)) ? Number(v) : 0;
@@ -101,6 +103,51 @@ function httpsPut(url, body = '', customHeaders = {}, timeoutMs = DEFAULT_TIMEOU
     req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
     req.on('error', e => reject(e));
     req.write(payload);
+    req.end();
+  });
+}
+
+function httpsPostJson(url, data = {}, customHeaders = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      return reject(new Error('invalid_url'));
+    }
+
+    const body = Buffer.from(
+      JSON.stringify(data || {}),
+      'utf8'
+    );
+
+    const req = https.request({
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': body.length,
+        Accept: 'application/json',
+        ...customHeaders
+      }
+    }, res => {
+      let responseBody = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => responseBody += chunk);
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        headers: res.headers,
+        body: responseBody
+      }));
+    });
+
+    req.setTimeout(
+      timeoutMs,
+      () => req.destroy(new Error('timeout'))
+    );
+    req.on('error', reject);
+    req.write(body);
     req.end();
   });
 }
@@ -387,6 +434,48 @@ async function validateBackupUpload(
     ownerYandexId,
     payloadHash: payloadCheck.actual,
     eventHashes
+  };
+}
+
+async function emitBackupAchievementReceipt(validation) {
+  if (
+    !SIGNALING_URL ||
+    !BACKUP_RECEIPT_SECRET ||
+    !validation?.ownerYandexId ||
+    !validation?.payloadHash
+  ) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'backup_receipt_not_configured'
+    };
+  }
+
+  const response = await httpsPostJson(
+    SIGNALING_URL,
+    {
+      action: 'backup_achievement_receipt',
+      ownerYandexId: validation.ownerYandexId,
+      payloadHash: validation.payloadHash
+    },
+    {
+      'X-Vi3-Backup-Secret': BACKUP_RECEIPT_SECRET
+    },
+    META_ONLY_TIMEOUT_MS
+  );
+
+  const data = safeParse(response.body) || {};
+
+  return {
+    ok:
+      response.status >= 200 &&
+      response.status < 300 &&
+      data.ok === true,
+    status: response.status,
+    duplicate: data.duplicate === true,
+    shadow: data.shadow !== false,
+    receiptId: safeString(data.receiptId),
+    error: safeString(data.error)
   };
 }
 
@@ -1213,20 +1302,22 @@ module.exports.handler = async event => {
       const payload = resolveUploadPayload(mode, body);
       if (!payload || typeof payload !== 'object') return reply(400, enrichBody(mode, { error: 'bad_upload_payload', path }));
 
+      let backupValidation = null;
+
       if (mode === 'upload_backup') {
-        const validation =
+        backupValidation =
           await validateBackupUpload(
             token,
             payload
           );
 
-        if (!validation.ok) {
+        if (!backupValidation.ok) {
           return reply(
-            validation.status || 409,
+            backupValidation.status || 409,
             enrichBody(mode, {
               ok: false,
-              error: validation.error,
-              validation
+              error: backupValidation.error,
+              validation: backupValidation
             })
           );
         }
@@ -1256,7 +1347,26 @@ module.exports.handler = async event => {
       if (pd && pd !== APP_ROOT) await ensureDiskDir(token, pd).catch(() => false);
       const wr = await uploadJsonResourceByPath(token, path, payload);
       if (!wr.ok) return reply(502, enrichBody(mode, { error: 'upload_proxy_write_failed', path, status: wr.status, raw: wr.raw }));
-      return reply(200, enrichBody(mode, { ok: true, path, status: wr.status }));
+
+      const rewardReceipt =
+        mode === 'upload_backup' &&
+        path === BACKUP_PATH &&
+        backupValidation?.ok
+          ? await emitBackupAchievementReceipt(
+              backupValidation
+            ).catch(error => ({
+              ok: false,
+              skipped: false,
+              error: normalizeErrMessage(error)
+            }))
+          : null;
+
+      return reply(200, enrichBody(mode, {
+        ok: true,
+        path,
+        status: wr.status,
+        rewardReceipt
+      }));
     } catch (e) {
       return reply(500, enrichBody(mode, { error: 'upload_proxy_error', message: safeString(e?.message), authValidationDegraded: !!valid.degraded }));
     }
